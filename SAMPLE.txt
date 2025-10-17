@@ -1,0 +1,431 @@
+<!-- Apache PDFBox -->
+<dependency>
+  <groupId>org.apache.pdfbox</groupId>
+  <artifactId>pdfbox</artifactId>
+  <version>2.0.29</version>
+</dependency>
+
+<!-- Optional OCR fallback (Tesseract) -->
+<dependency>
+  <groupId>net.sourceforge.tess4j</groupId>
+  <artifactId>tess4j</artifactId>
+  <version>5.6.0</version>
+</dependency>
+
+<!-- Google GenAI client (your com.google.genai client) - keep your SDK version -->
+<!-- Add your com.google.genai dependency you already use -->
+
+
+// PositionTextStripper.java
+import org.apache.pdfbox.text.PDFTextStripper;
+import org.apache.pdfbox.text.TextPosition;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+/**
+ * Collects text fragments (string + bounding box + font info) while scanning the PDF.
+ */
+public class PositionTextStripper extends PDFTextStripper {
+
+    public static class TextChunk {
+        public final String text;
+        public final float x;       // left coordinate in user space units
+        public final float y;       // baseline y coordinate
+        public final float width;   // width of the chunk
+        public final float height;  // estimated height (font size)
+        public final float fontSize;
+        public final String fontName;
+        public final int pageIndex; // 0-based
+
+        public TextChunk(String text, float x, float y, float width, float height,
+                         float fontSize, String fontName, int pageIndex) {
+            this.text = text;
+            this.x = x; this.y = y; this.width = width; this.height = height;
+            this.fontSize = fontSize; this.fontName = fontName; this.pageIndex = pageIndex;
+        }
+
+        public String toString() {
+            return "TextChunk(page=" + pageIndex + ", x=" + x + ", y=" + y + ", w=" + width + ", h=" + height + ", text=" + text + ")";
+        }
+    }
+
+    private final List<TextChunk> chunks = new ArrayList<>();
+    private int currentPage = 0;
+
+    public PositionTextStripper() throws IOException {
+        super.setSortByPosition(true);
+    }
+
+    @Override
+    protected void startPage(org.apache.pdfbox.pdmodel.PDPage page) throws IOException {
+        currentPage++;
+        super.startPage(page);
+    }
+
+    @Override
+    protected void writeString(String string, List<TextPosition> textPositions) throws IOException {
+        if (textPositions == null || textPositions.isEmpty()) return;
+        TextPosition first = textPositions.get(0);
+        float x = first.getXDirAdj();
+        float y = first.getYDirAdj();
+        float fontSize = first.getFontSizeInPt();
+        String fontName = first.getFont().getName();
+        float width = 0f;
+        float maxHeight = 0f;
+        for (TextPosition tp : textPositions) {
+            width += tp.getWidthDirAdj();
+            maxHeight = Math.max(maxHeight, tp.getHeightDir());
+        }
+        // store chunk; pageIndex = currentPage - 1 (0-based)
+        chunks.add(new TextChunk(string, x, y, width, maxHeight, fontSize, fontName, currentPage - 1));
+        super.writeString(string, textPositions);
+    }
+
+    public List<TextChunk> getChunks() {
+        return Collections.unmodifiableList(chunks);
+    }
+}
+
+
+// PdfTranslatorEngine.java
+import com.google.genai.Client;
+import com.google.genai.types.Content;
+import com.google.genai.types.Part;
+import com.google.genai.types.GenerateContentResponse;
+
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.PDPageContentStream;
+import org.apache.pdfbox.pdmodel.font.PDType0Font;
+
+import java.awt.Color;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Files;
+import java.util.*;
+import java.util.stream.Collectors;
+
+/**
+ * High-level engine:
+ *  - extract chunks with PositionTextStripper
+ *  - group chunks per page into line-level groups for translation
+ *  - call Gemini via com.google.genai.Client in batches
+ *  - blank original text rectangles and render translated text
+ */
+public class PdfTranslatorEngine {
+
+    private final Client genaiClient;
+    private final String modelId; // your gemini model id
+    private final Path fallbackFontPath; // path to a TTF that supports the target language (nullable)
+    private final int batchMaxChars = 18_000; // tune: how many chars to send per translate call
+
+    public PdfTranslatorEngine(Client client, String modelId, Path fallbackFontPath) {
+        this.genaiClient = client;
+        this.modelId = modelId;
+        this.fallbackFontPath = fallbackFontPath;
+    }
+
+    /**
+     * Main method: translate inputPdf to English and return bytes of translated PDF.
+     */
+    public byte[] translatePdf(Path inputPdf) throws Exception {
+        // 1) Extract text chunks
+        List<PositionTextStripper.TextChunk> chunks = extractChunks(inputPdf);
+
+        // 2) Group chunks by page and group adjacent chunks into lines (simple grouping by y coord)
+        Map<Integer, List<PositionTextStripper.TextChunk>> byPage = chunks.stream()
+                .collect(Collectors.groupingBy(c -> c.pageIndex, TreeMap::new, Collectors.toList()));
+
+        // For each page create line-groups
+        Map<Integer, List<LineGroup>> pageLineGroups = new TreeMap<>();
+        for (Map.Entry<Integer, List<PositionTextStripper.TextChunk>> e : byPage.entrySet()) {
+            List<PositionTextStripper.TextChunk> pageChunks = e.getValue();
+            List<LineGroup> lines = groupChunksIntoLines(pageChunks);
+            pageLineGroups.put(e.getKey(), lines);
+        }
+
+        // 3) Prepare strings to translate (keep ordering) and record mapping
+        List<TranslateItem> items = new ArrayList<>();
+        for (Map.Entry<Integer, List<LineGroup>> ent : pageLineGroups.entrySet()) {
+            int page = ent.getKey();
+            for (LineGroup lg : ent.getValue()) {
+                items.add(new TranslateItem(page, lg, lg.getText()));
+            }
+        }
+
+        // 4) Batch translate strings with Gemini
+        List<String> translations = translateBatched(items.stream().map(i -> i.text).collect(Collectors.toList()));
+
+        if (translations.size() != items.size()) {
+            throw new IllegalStateException("Translation returned mismatched item count");
+        }
+
+        // map translations back to items
+        for (int i = 0; i < items.size(); ++i) {
+            items.get(i).translated = translations.get(i);
+        }
+
+        // 5) Re-render PDF: blank each line group's bounding box and draw translated lines
+        byte[] outputPdf = redrawPdfWithTranslations(inputPdf, items);
+
+        return outputPdf;
+    }
+
+    // small helper classes
+    private static class LineGroup {
+        final List<PositionTextStripper.TextChunk> chunks;
+        LineGroup(List<PositionTextStripper.TextChunk> chunks) { this.chunks = chunks; }
+        String getText() {
+            return chunks.stream().map(c -> c.text).collect(Collectors.joining(" "));
+        }
+        float x() {
+            return chunks.stream().map(c -> c.x).min(Float::compare).orElse(0f);
+        }
+        float y() {
+            // baseline y: take max to align baseline
+            return chunks.stream().map(c -> c.y).max(Float::compare).orElse(0f);
+        }
+        float width() {
+            // bounding width
+            float minX = chunks.stream().map(c -> c.x).min(Float::compare).orElse(0f);
+            float maxRight = chunks.stream().map(c -> c.x + c.width).max(Float::compare).orElse(0f);
+            return maxRight - minX;
+        }
+        float height() {
+            return chunks.stream().map(c -> c.height).max(Float::compare).orElse(12f);
+        }
+    }
+    private static class TranslateItem {
+        final int page;
+        final LineGroup group;
+        final String text;
+        String translated;
+        TranslateItem(int page, LineGroup group, String text) { this.page = page; this.group = group; this.text = text; }
+    }
+
+    // Extract text chunks using PositionTextStripper
+    private List<PositionTextStripper.TextChunk> extractChunks(Path pdf) throws IOException {
+        try (PDDocument doc = PDDocument.load(pdf.toFile())) {
+            PositionTextStripper stripper = new PositionTextStripper();
+            stripper.setStartPage(1);
+            stripper.setEndPage(doc.getNumberOfPages());
+            stripper.getText(doc); // populates chunks
+            return stripper.getChunks();
+        }
+    }
+
+    // Group chunks into line-groups by y (simple clustering)
+    private List<LineGroup> groupChunksIntoLines(List<PositionTextStripper.TextChunk> pageChunks) {
+        // sort by y desc (top to bottom), then x asc
+        List<PositionTextStripper.TextChunk> sorted = new ArrayList<>(pageChunks);
+        sorted.sort(Comparator.comparingDouble((PositionTextStripper.TextChunk c) -> -c.y).thenComparingDouble(c -> c.x));
+
+        List<LineGroup> lines = new ArrayList<>();
+        double yTolerance = 4.0; // points tolerance to consider same line (tune)
+        for (PositionTextStripper.TextChunk c : sorted) {
+            boolean added = false;
+            for (LineGroup lg : lines) {
+                if (Math.abs(lg.y() - c.y) <= yTolerance) {
+                    lg.chunks.add(c);
+                    added = true;
+                    break;
+                }
+            }
+            if (!added) {
+                // new line
+                List<PositionTextStripper.TextChunk> list = new ArrayList<>();
+                list.add(c);
+                LineGroup ng = new LineGroup(list);
+                lines.add(ng);
+            }
+        }
+        // ensure chunks in a line are sorted left-to-right
+        for (LineGroup lg : lines) lg.chunks.sort(Comparator.comparingDouble(cc -> cc.x));
+        return lines;
+    }
+
+    // Batch translate text pieces. Uses Gemini via com.google.genai.Client.
+    // This sample sends multiple items per request (up to batchMaxChars total chars).
+    private List<String> translateBatched(List<String> texts) throws Exception {
+        List<String> out = new ArrayList<>(Collections.nCopies(texts.size(), ""));
+        int idx = 0;
+        while (idx < texts.size()) {
+            int start = idx;
+            int totalChars = 0;
+            StringBuilder sb = new StringBuilder();
+            while (idx < texts.size() && totalChars + texts.get(idx).length() < batchMaxChars) {
+                sb.append("### ITEM ").append(idx).append("\n");
+                sb.append(texts.get(idx)).append("\n\n");
+                totalChars += texts.get(idx).length();
+                idx++;
+            }
+            // prompt translation for the batch
+            String instruction = """
+                Translate the following items to fluent, idiomatic English.
+                For each item output only the translated text on its own line, in the same order.
+                Do NOT add numbering or extra explanation.
+                """;
+            String batchInput = instruction + "\n\n" + sb.toString();
+
+            // Build content for Gemini
+            List<Content> content = List.of(
+                    Content.builder().role("system").parts(List.of(Part.builder().text("You are a professional translator.").build())).build(),
+                    Content.builder().role("user").parts(List.of(Part.builder().text(batchInput).build())).build()
+            );
+            GenerateContentResponse resp = genaiClient.models().generateContent(modelId, content, null);
+            String raw = resp.text(); // raw multi-line replies
+
+            // split raw by lines and map back
+            // We expect exactly (idx-start) lines of translation. We'll heuristically split by newline blocks.
+            List<String> candidateLines = Arrays.stream(raw.split("\\r?\\n"))
+                    .map(String::trim).filter(s -> !s.isEmpty()).collect(Collectors.toList());
+
+            // If the model returned fewer lines, attempt to split on double-newlines
+            if (candidateLines.size() < (idx - start)) {
+                candidateLines = Arrays.stream(raw.split("\\r?\\n\\r?\\n"))
+                        .map(String::trim).filter(s -> !s.isEmpty()).collect(Collectors.toList());
+            }
+
+            // If still mismatch, then fallback: assign full response to the first item and leave others blank
+            if (candidateLines.size() == (idx - start)) {
+                for (int k = start; k < idx; ++k) {
+                    out.set(k, candidateLines.get(k - start));
+                }
+            } else {
+                // best-effort: try to parse by markers "### ITEM i" if the model echoed them
+                // fallback: split block into near-equal parts
+                int count = idx - start;
+                int approxCharsPer = Math.max(1, raw.length() / count);
+                for (int k = 0; k < count; ++k) {
+                    int from = Math.min(raw.length(), k * approxCharsPer);
+                    int to = Math.min(raw.length(), (k + 1) * approxCharsPer);
+                    out.set(start + k, raw.substring(from, to).trim());
+                }
+            }
+        }
+        return out;
+    }
+
+    // Re-render: open original PDF, for each TranslateItem blank area and draw translated text at same coords.
+    private byte[] redrawPdfWithTranslations(Path inputPdf, List<TranslateItem> items) throws IOException {
+        // group items per page
+        Map<Integer, List<TranslateItem>> perPage = new TreeMap<>();
+        for (TranslateItem t : items) perPage.computeIfAbsent(t.page, p -> new ArrayList<>()).add(t);
+
+        try (PDDocument doc = PDDocument.load(inputPdf.toFile())) {
+            // load a fallback font if provided; otherwise use Helvetica (may not support many scripts)
+            PDType0Font pdFont = null;
+            if (fallbackFontPath != null && Files.exists(fallbackFontPath)) {
+                pdFont = PDType0Font.load(doc, fallbackFontPath.toFile());
+            }
+
+            for (Map.Entry<Integer, List<TranslateItem>> e : perPage.entrySet()) {
+                int pageIndex = e.getKey();
+                PDPage page = doc.getPage(pageIndex);
+                List<TranslateItem> pageItems = e.getValue();
+
+                // Append drawing content
+                try (PDPageContentStream cs = new PDPageContentStream(doc, page, PDPageContentStream.AppendMode.APPEND, true, true)) {
+                    cs.setNonStrokingColor(Color.WHITE);
+
+                    for (TranslateItem it : pageItems) {
+                        LineGroup lg = it.group;
+                        // compute bounding rect to blank: x,y,width,height
+                        float x = lg.x();
+                        float y = lg.y() - lg.height(); // approximate bottom
+                        float w = lg.width();
+                        float h = lg.height() * 1.2f;
+
+                        // blank background
+                        cs.addRect(x, y, w, h);
+                        cs.fill();
+
+                        // draw translated text: do wrapping to fit width
+                        String translated = it.translated == null ? "" : it.translated;
+                        // choose font and size
+                        float fontSize = lg.chunks.get(0).fontSize; // try to preserve original size
+                        if (fontSize <= 0) fontSize = 10f;
+
+                        if (pdFont != null) {
+                            cs.beginText();
+                            cs.setFont(pdFont, fontSize);
+                            cs.newLineAtOffset(x, lg.y() - fontSize);
+                            List<String> lines = wrapText(translated, pdFont, fontSize, w);
+                            for (String line : lines) {
+                                cs.showText(line);
+                                cs.newLineAtOffset(0, -fontSize * 1.1f);
+                            }
+                            cs.endText();
+                        } else {
+                            // fallback to Type1 Helvetica (limited unicode)
+                            cs.beginText();
+                            cs.setFont(org.apache.pdfbox.pdmodel.font.PDType1Font.HELVETICA, fontSize);
+                            cs.newLineAtOffset(x, lg.y() - fontSize);
+                            List<String> lines = wrapTextWithType1Font(translated, org.apache.pdfbox.pdmodel.font.PDType1Font.HELVETICA, fontSize, w);
+                            for (String line : lines) {
+                                cs.showText(line);
+                                cs.newLineAtOffset(0, -fontSize * 1.1f);
+                            }
+                            cs.endText();
+                        }
+                    }
+                }
+            }
+
+            // output to bytes
+            try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+                doc.save(baos);
+                return baos.toByteArray();
+            }
+        }
+    }
+
+    // Utility: wrap text for PDType0Font using width measurement
+    private List<String> wrapText(String text, PDType0Font font, float fontSize, float maxWidth) throws IOException {
+        List<String> lines = new ArrayList<>();
+        if (text == null || text.isBlank()) return lines;
+        String[] words = text.split("\\s+");
+        StringBuilder cur = new StringBuilder();
+        for (String w : words) {
+            String cand = cur.length() == 0 ? w : cur + " " + w;
+            float width = font.getStringWidth(cand) / 1000f * fontSize;
+            if (width > maxWidth && cur.length() > 0) {
+                lines.add(cur.toString());
+                cur.setLength(0);
+                cur.append(w);
+            } else {
+                if (cur.length() > 0) cur.append(" ");
+                cur.append(w);
+            }
+        }
+        if (cur.length() > 0) lines.add(cur.toString());
+        return lines;
+    }
+
+    // Utility: wrap text for PDType1 (limited unicode support)
+    private List<String> wrapTextWithType1Font(String text, org.apache.pdfbox.pdmodel.font.PDFont font, float fontSize, float maxWidth) throws IOException {
+        List<String> lines = new ArrayList<>();
+        if (text == null || text.isBlank()) return lines;
+        String[] words = text.split("\\s+");
+        StringBuilder cur = new StringBuilder();
+        for (String w : words) {
+            String cand = cur.length() == 0 ? w : cur + " " + w;
+            float width = font.getStringWidth(cand) / 1000f * fontSize;
+            if (width > maxWidth && cur.length() > 0) {
+                lines.add(cur.toString());
+                cur.setLength(0);
+                cur.append(w);
+            } else {
+                if (cur.length() > 0) cur.append(" ");
+                cur.append(w);
+            }
+        }
+        if (cur.length() > 0) lines.add(cur.toString());
+        return lines;
+    }
+}
